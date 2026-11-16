@@ -9,90 +9,34 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
-import java.util.Map;
-import java.util.TreeMap;
 
-public final class SegmentMetadataStore implements AutoCloseable {
+public final class SegmentMetadataStore {
     public record Segment(long startTime, long endTime) {
     }
 
     private static final int SEGMENT_RECORD_SIZE = 16;
     private final Path root;
     private final Path segmentsDirectory;
-    private final Path cataloguePath;
-    private final Map<Long, Segment> catalogue = new TreeMap<>();
-    private final FileChannel catalogueChannel;
 
     public SegmentMetadataStore(Path root) throws IOException {
         this.root = root;
         this.segmentsDirectory = root.resolve("segments");
-        this.cataloguePath = root.resolve("segments.index");
 
         Files.createDirectories(segmentsDirectory);
-        catalogueChannel = FileChannel.open(cataloguePath,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.DSYNC);
-        loadCatalogue();
     }
 
-    private void loadCatalogue() throws IOException {
-        long size = catalogueChannel.size();
-        long complete = size / SEGMENT_RECORD_SIZE;
-        if (size % SEGMENT_RECORD_SIZE != 0) {
-            catalogueChannel.truncate(complete * SEGMENT_RECORD_SIZE);
-        }
-
-        for (long i = 0; i < complete; i++) {
-            ByteBuffer b = ByteBuffer.allocate(SEGMENT_RECORD_SIZE)
-                    .order(ByteOrder.BIG_ENDIAN);
-            readFully(catalogueChannel, b, i * SEGMENT_RECORD_SIZE);
-            b.flip();
-
-            long start = b.getLong();
-            long end = b.getLong();
-            if (end <= start || catalogue.containsKey(start)) {
-                throw new IOException("Invalid segment catalogue entry");
-            }
-            catalogue.put(start, new Segment(start, end));
-        }
-    }
-
-    public synchronized void ensureSegment(long start, long end)
-            throws IOException {
-        Segment existing = catalogue.get(start);
-        if (existing != null) {
-            if (existing.endTime() != end) {
-                throw new IOException("Conflicting segment boundaries");
-            }
-            return;
-        }
-
-        ByteBuffer b = ByteBuffer.allocate(SEGMENT_RECORD_SIZE)
-                .order(ByteOrder.BIG_ENDIAN);
-        b.putLong(start).putLong(end).flip();
-
-        writeFully(catalogueChannel, b, catalogueChannel.size());
-        catalogue.put(start, new Segment(start, end));
-    }
-
-    public synchronized List<Segment> getSegments() {
-        return Collections.unmodifiableList(new ArrayList<>(catalogue.values()));
-    }
-
-    public synchronized List<Long> readBlockIds(long segmentStart, long agentId)
+    public List<Long> readBlockIds(long segmentStart, long agentId)
             throws IOException {
         Path path = mappingPath(segmentStart, agentId);
         if (!Files.exists(path))
             return new ArrayList<>();
 
         try (FileChannel channel = FileChannel.open(path,
-                StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                StandardOpenOption.READ)) {
             long size = channel.size();
             long complete = size / Long.BYTES;
+            // Since all ids should be in long so trimming any extra tail bytes
             if (size % Long.BYTES != 0) {
                 channel.truncate(complete * Long.BYTES);
             }
@@ -104,9 +48,12 @@ public final class SegmentMetadataStore implements AutoCloseable {
                 readFully(channel, b, i * Long.BYTES);
                 b.flip();
                 long id = b.getLong();
-                if (id < 0)
-                    throw new IOException("Invalid block ID in mapping");
-                ids.add(id);
+                if (id >= 0)
+                    ids.add(id);
+                // negative ids r invalid --> further checks of validity of id will be handled
+                // by BlockMetaDataStore
+                // we just skip invalid values (if some corrupt data passed here as seemingly
+                // valid the read BlockMetaDataStore Tries to catch them but its not guranteed)
             }
             return ids;
         }
@@ -114,6 +61,12 @@ public final class SegmentMetadataStore implements AutoCloseable {
 
     public synchronized void addBlockMapping(
             long segmentStart, long agentId, long blockId) throws IOException {
+        // When you actually introduce multiple writers, replace this coarse lock
+        // (synchronized) with per-file or striped locking
+        // in that we need to think about remove older locks in some way to avoid memory
+        // leakage but also need to take care regarding the segment boundary being
+        // defined by timestamps of the agents which is not global or sync time which
+        // can complicate things pretty fast
         if (blockId < 0)
             throw new IllegalArgumentException("Negative block ID");
 
@@ -166,8 +119,4 @@ public final class SegmentMetadataStore implements AutoCloseable {
         }
     }
 
-    @Override
-    public void close() throws IOException {
-        catalogueChannel.close();
-    }
 }

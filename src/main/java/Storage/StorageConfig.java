@@ -47,7 +47,7 @@ public final class StorageConfig {
             case "LITTLE_ENDIAN" -> ByteOrder.LITTLE_ENDIAN;
             default -> throw new IOException("Invalid byteOrder");
         };
-        if (maxMessage > blockSize) {
+        if (maxMessage + Long.BYTES > blockSize) {
             throw new IOException(
                     "maxMessageSize must not exceed blockSize");
         }

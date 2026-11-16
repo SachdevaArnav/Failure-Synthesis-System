@@ -7,18 +7,21 @@ import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.zip.CRC32;
 
 public final class BlockMetadataStore implements AutoCloseable {
-    private static final int RECORD_SIZE = 40;
+    private static final int RECORD_SIZE = 44;
 
     private final FileChannel channel;
+    private final int blockSize;
 
-    public BlockMetadataStore(Path path) throws IOException {
+    public BlockMetadataStore(Path path, int blockSize) throws IOException {
         channel = FileChannel.open(path,
                 StandardOpenOption.CREATE,
                 StandardOpenOption.READ,
                 StandardOpenOption.WRITE,
                 StandardOpenOption.DSYNC);
+        this.blockSize = blockSize;
     }
 
     public synchronized void write(BlockMetadata metadata) throws IOException {
@@ -28,11 +31,17 @@ public final class BlockMetadataStore implements AutoCloseable {
         b.putLong(metadata.blockId());
         b.putLong(metadata.storageOffset());
         b.putInt(metadata.usedLength());
-        b.putInt(0);
         b.putLong(metadata.startTime());
         b.putLong(metadata.endTime());
         b.flip();
-
+        CRC32 checksum = new CRC32();
+        checksum.update(b);
+        b.position(b.limit());
+        b.limit(b.capacity());
+        b.putLong(checksum.getValue());
+        b.flip();
+        // here we r using multiplyExact to safeguard the stored data from silent
+        // corruption due to numeric overflow
         writeFully(b, Math.multiplyExact(metadata.blockId(), (long) RECORD_SIZE));
     }
 
@@ -48,22 +57,23 @@ public final class BlockMetadataStore implements AutoCloseable {
 
         ByteBuffer b = ByteBuffer.allocate(RECORD_SIZE).order(ByteOrder.BIG_ENDIAN);
         readFully(b, offset);
-        b.flip();
-
+        b.rewind();
         BlockMetadata metadata = new BlockMetadata(
-                b.getLong(), b.getLong(), b.getInt(), skipReservedAndReadStart(b),
+                b.getLong(), b.getLong(), b.getInt(), b.getLong(),
                 b.getLong());
-
+        long checksum = b.getLong();
+        b.rewind();
+        b.limit(RECORD_SIZE - 8);
+        CRC32 check = new CRC32();
+        check.update(b);
+        if (checksum != check.getValue()) {
+            throw new IOException("Checksum failed");
+        }
         if (metadata.blockId() != blockId) {
             throw new IOException("Block metadata ID mismatch at " + blockId);
         }
         validate(metadata);
         return metadata;
-    }
-
-    private static long skipReservedAndReadStart(ByteBuffer b) {
-        b.getInt(); // reserved
-        return b.getLong();
     }
 
     public synchronized long nextBlockId() throws IOException {
@@ -75,13 +85,10 @@ public final class BlockMetadataStore implements AutoCloseable {
             channel.truncate(completeRecords * RECORD_SIZE);
         }
 
-        for (long id = 0; id < completeRecords; id++) {
-            read(id); // Fail closed if a complete metadata record is invalid.
-        }
         return completeRecords;
     }
 
-    private static void validate(BlockMetadata m) throws IOException {
+    private void validate(BlockMetadata m) throws IOException {
         if (m.blockId() < 0 || m.storageOffset() < 0 || m.usedLength() < 0) {
             throw new IOException("Invalid block metadata");
         }
@@ -91,6 +98,12 @@ public final class BlockMetadataStore implements AutoCloseable {
             }
         } else if (m.startTime() > m.endTime()) {
             throw new IOException("Invalid block time range");
+        }
+        if (m.usedLength() > blockSize) {
+            throw new IOException("Used Length greater than Maximum Block Size not possible");
+        }
+        if (m.storageOffset() != m.blockId() * blockSize) {
+            throw new IOException("Invalid Storage Offset");
         }
     }
 
